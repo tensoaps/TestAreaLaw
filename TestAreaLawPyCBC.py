@@ -5,11 +5,15 @@ import matplotlib.pyplot as plt
 run_code = 1 
 use_server = 0 
 plot_result = 0
+useMECO = True
 use_ratio = False
 useGatedModel = True
 sampler_name = ['dynesty', 'pymultinest'][0]
-sample_method = ['rwalk', 'rslice'][0]
+sample_method = ['rwalk', 'rslice'][1]
 if use_server:
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ["OMP_NUM_THREADS"] = '1'
     pool_size, npoints = [8, 16], 2000
 else:
     pool_size, npoints = [1, 1], 400
@@ -41,14 +45,11 @@ for seed in seed_list:
     seedbank.append([np.random.randint(1e5, 1e6, 5), np.random.randint(1e5, 1e6, 5)])
 seedlist = seedbank[task_num2]
 label = label_list[task_num1]+'_seed'+sys.argv[2]
+label += '_thmeco' if useMECO else '_tmerger'
 
-duration = 8
-delta_f = 1./duration
-sampling_frequency = 4096
+sampling_frequency = 1024
 f_nqy = sampling_frequency/2
-delta_t = 1./sampling_frequency
-psd_length = int(f_nqy*duration)+1
-f_lower, f_upper, f_ref = 15, 2048, 20
+f_lower, f_upper, f_ref = 15, f_nqy, 20
 template_list = ['IMRPhenomXPHM', 'IMRPhenomPv3HM']
 template_name = template_list[0]
 label = label+'_'+template_name
@@ -58,6 +59,13 @@ if run_code:
     import bilby
     from bilby.core.utils import setup_logger
     setup_logger(log_level=['info', 'warning'][0])
+    if use_server:
+        def notice_ding(message='Finished'):
+            import os
+            from dingtalkchatbot.chatbot import DingtalkChatbot
+            webhook = os.environ['WEBHOOK_OF_TANG']
+            xiaoding = DingtalkChatbot(webhook)
+            xiaoding.send_text(msg=message)
     det_names = ['H1', 'L1', 'V1', 'K1', 'I1']
 
     load_utils = 1
@@ -118,17 +126,32 @@ if run_code:
         from pycbc.inference.models import GaussianNoise, CallModel, GatedGaussianNoise
         from pycbc.waveform.generator import FDomainDetFrameGenerator, FDomainCBCGenerator
         from pycbc.conversions import mass1_from_mchirp_q, mass2_from_mchirp_q # pycbc use q=m1/m2
-        def calculate_thMECO(detframe_waveforms, f_hMECO, parameters, start_time, f_lower, duration, det='H1'):
+        def calculate_thMECO(detframe_waveforms, f_hMECO, parameters, \
+                start_time, duration, f_lower, true_flow, det='H1', plot=True):
             flower_idx = int((f_lower+1)*duration)
             wfs_det = detframe_waveforms[det]
             freq_array = wfs_det.sample_frequencies[flower_idx:].numpy()
             fhMECO_idx = np.where(freq_array <= f_hMECO)[0][-1]
-            t_from_freq = time_from_frequencyseries(\
-                wfs_det[flower_idx:], sample_frequencies=freq_array)
+            true_flow_idx = np.where(freq_array <= true_flow)[0][-1]
+            t_from_freq = time_from_frequencyseries(wfs_det[flower_idx:], \
+                sample_frequencies=freq_array, discont_threshold=0.99*np.pi)
             t_hMECO = t_from_freq[fhMECO_idx]
+            insp_duration = t_hMECO - t_from_freq[true_flow_idx]
+            if plot:
+                _, ax = plt.subplots()
+                ax.plot(freq_array[:-1], t_from_freq)
+                ax.axvline(f_hMECO, c='red')
+                ax.axvline(true_flow, c='red')
+                plt.xlabel('freqs [Hz]')
+                plt.ylabel('time [s]')
+                plt.show()
             tdelay = Detector(det).time_delay_from_earth_center(\
                 parameters['ra'], parameters['dec'], parameters['tc'])
-            return t_hMECO-tdelay+start_time+duration
+            if t_hMECO > 0:
+                t_hMECO += float(t_from_freq.epoch)
+            else:
+                t_hMECO += (start_time+duration)
+            return t_hMECO-tdelay, insp_duration
 
         class InspiralLikelihood(bilby.Likelihood):
             def __init__(self, det_names, start_time, duration, strain_data, psds, gate_time_start, useGatedModel=False, **kwargs):
@@ -148,12 +171,6 @@ if run_code:
                         self.model = GatedGaussianNoise(waveform_params, strain_data, f_lower, psds=psds, static_params=self.static_params)
                         self.model.update(**self.gate_parames)
                         self.lognl = self.model._lognl()
-                        # insert the following codes to gate_and_paint()
-                        #invpsd = invpsd.copy()
-                        #bad_values = invpsd.numpy()
-                        #bad_length = len(numpy.where(numpy.isnan(bad_values)
-                        #    +(~numpy.isfinite(bad_values)))[0])
-                        #invpsd[0:bad_length] = 0
                     else:
                         self.model = GaussianNoise(waveform_params, strain_data, f_lower, psds=psds, static_params=self.static_params)
                         self.lognl = self.model.lognl
@@ -244,58 +261,74 @@ if run_code:
         iota_spin_xyz = bilby_to_lalsimulation_spins(*(secon_gen_value[:9]+[f_ref, secon_gen_value[10]]))
         f_hMECO_2g = hybrid_meco_frequency(secon_gen_value[7], secon_gen_value[8], iota_spin_xyz[3], iota_spin_xyz[6])
 
+        inje_list = []
+        seed_idx = []
         injection_parameters = {}
         if event_idx[0]:
             fcut_list.append(f_hMECO_1g)
             injection_parameters.update(first_gen_param)
+            inje_list.append(dict(zip(bilby_vari_name, first_gen_value+share_par_value)))
+            seed_idx.append(0)
         if event_idx[1]:
             fcut_list.append(f_hMECO_2g)
             injection_parameters.update(secon_gen_param)
+            inje_list.append(dict(zip(bilby_vari_name, secon_gen_value+share_par_value)))
+            seed_idx.append(1)
         injection_parameters.update(share_parameter)
 
 
-        # load psd files
-        PSDs = {}
+        # generate mock GW strains
         from pycbc.psd import from_txt
         if 'O5' in label:
             asd_filelist = ['AplusDesign', 'AplusDesign', 'avirgo_O5high_NEW', 'kagra_128Mpc', 'AplusDesign']
         else:
             asd_filelist = ['aligo_O4high', 'aligo_O4high', 'avirgo_O4high_NEW', 'kagra_10Mpc']
-        for det,fname in zip(det_names, asd_filelist):
-            if use_server:
-                fpath = '/data/home/public/share/GWRawDataPSD/T2000012-v1/'+fname+'.txt'
-            else:
-                fpath = '/Users/tangsp/Work/GW/Codes/GW/Frames/PSDs/T2000012-v2/'+fname+'.txt'
-            PSDs.update({det: from_txt(fpath, psd_length, 1./duration, f_lower, is_asd_file=True)})
-
-
-        # generate mock GW strains
         det_names = det_names[:len(asd_filelist)]
-        inje_list = []
-        if event_idx[0]:
-            inje_list.append(dict(zip(bilby_vari_name, first_gen_value+share_par_value)))
-        if event_idx[1]:
-            inje_list.append(dict(zip(bilby_vari_name, secon_gen_value+share_par_value)))
 
-        from pycbc.noise.gaussian import frequency_noise_from_psd
-        noises_list = []
-        if event_idx[0]:
-            noises_list.append({det: frequency_noise_from_psd(PSDs[det], seed=seedlist[0][i]) for i,det in enumerate(det_names)})
-        if event_idx[1]:
-            noises_list.append({det: frequency_noise_from_psd(PSDs[det], seed=seedlist[1][i]) for i,det in enumerate(det_names)})
-
+        psds_list = []
         strains_list = []
+        duration_list = []
         start_time_list = []
         static_params = {'approximant': template_name, 'f_lower': f_lower, 'f_final': f_upper, 'f_ref': f_ref}
-        for i,(noise_fd,parameters) in enumerate(zip(noises_list, inje_list)):
+        from pycbc.noise.gaussian import frequency_noise_from_psd
+        for i,parameters in enumerate(inje_list):
             inject_parameters = transform_bilby_to_pycbc(parameters, f_ref=f_ref, return_iota=True)
             time_of_event = parameters['geocent_time']
-            start_time = time_of_event - duration + 1
+            temp_flow, temp_fhigh, temp_duration = 10, 2048, 64
+            static_params.update({'f_lower':temp_flow, 'f_final': temp_fhigh})
+            temp_start_time = time_of_event - temp_duration + 2
+            InjectModel = InspiralLikelihood(det_names, temp_start_time, \
+                temp_duration, None, None, None, **static_params)
+            signals_fd_dict = InjectModel.FDGen_model.generate(**inject_parameters)
+            t_gate_start, insp_time = calculate_thMECO(signals_fd_dict, fcut_list[i], inject_parameters, \
+                temp_start_time, temp_duration, temp_flow, f_lower, det='H1', plot=~use_server)
+            print('tc - thMECO = {}ms,'.format(\
+            	int(1000*(time_of_event-t_gate_start))), \
+            	'inspiral duration = {:.2}s'.format(insp_time))
+            if useMECO:
+                gate_time_list.append(t_gate_start)
+            else:
+                gate_time_list.append(time_of_event)
+            duration = 2**(np.ceil(np.log2(insp_time)))
+            duration_list.append(duration)
+            start_time = time_of_event - duration + 0.2
             start_time_list.append(start_time)
+            static_params.update({'f_lower':f_lower, 'f_final': f_upper})
             InjectModel = InspiralLikelihood(det_names, start_time, duration, None, None, None, **static_params)
             signals_fd_dict = InjectModel.FDGen_model.generate(**inject_parameters)
-            gate_time_list.append(calculate_thMECO(signals_fd_dict, fcut_list[i], \
-                inject_parameters, start_time, f_lower, duration, det='H1'))
+            PSDs, noise_fd = {}, {}
+            psd_length = int(f_nqy*duration)+1
+            for j,(det,fname) in enumerate(zip(det_names, asd_filelist)):
+                if use_server:
+                    fpath = '/data/home/public/share/GWRawDataPSD/T2000012-v1/'+fname+'.txt'
+                else:
+                    fpath = '/Users/tangsp/Work/GW/Codes/GW/Frames/PSDs/T2000012-v2/'+fname+'.txt'
+                psd = from_txt(fpath, psd_length, 1./duration, f_lower, is_asd_file=True)
+                noise_fd.update({det: frequency_noise_from_psd(psd, seed=seedlist[seed_idx[i]][j])})
+                flow_index = int(f_lower*duration)
+                psd[:flow_index] = psd[flow_index]
+                PSDs.update({det: psd})
+            psds_list.append(PSDs)
             strains_fd_dict = {det: signals_fd_dict[det]+noise_fd[det] for det in det_names}
             strains_list.append(strains_fd_dict)
 
@@ -344,8 +377,8 @@ if run_code:
 
         bilby_vari_name = bilby_vari_name[0:7]+bilby_vari_name[9:]
         bilby_vari_name += ['chirp_mass', 'mass_ratio']
-        llh_func_list = [InspiralLikelihood(det_names, start_time_list[i], duration, strains_list[i], \
-            PSDs, gate_time_list[i], useGatedModel=useGatedModel, **static_params) for i in range(len(event_tag_list))]
+        llh_func_list = [InspiralLikelihood(det_names, start_time_list[i], duration_list[i], strains_list[i], \
+            psds_list[i], gate_time_list[i], useGatedModel=useGatedModel, **static_params) for i in range(len(event_tag_list))]
 
         likelihood = MultiEventLikelihood(likelihood_list=llh_func_list, parameters_list=bilby_vari_name, \
             share_par_names=share_par_names, priors=priors, f_ref=f_ref, event_tag_list=event_tag_list, pycbc_params=None)
@@ -355,9 +388,11 @@ if run_code:
         for llk_model in likelihood.likelihood_list:
             print(llk_model.calculate_optimalSNR())
 
-        sampling = 1
+        sampling = 0
         if sampling:
             result = bilby.run_sampler(likelihood=likelihood, priors=priors, use_ratio=use_ratio, live_points=None, sampler='dynesty', \
                 npoints=npoints, dlogz=1e-3, sample=sample_method, queue_size=pool_size, injection_parameters=injection_parameters, \
                 outdir=outdir, label=label+'_dynesty_'+sample_method)
             result.plot_corner()
+            if use_server:
+                notice_ding('您的任务：{} {} {} 已经完成！释放了{}个线程。'.format(sys.argv[0], task_num1, task_num2, pool_size))
