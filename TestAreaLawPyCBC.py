@@ -14,7 +14,7 @@ if use_server:
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
     os.environ["OMP_NUM_THREADS"] = '1'
-    pool_size, npoints = [8, 16], 2000
+    pool_size, npoints = [16, 48], 2000
 else:
     pool_size, npoints = [1, 1], 400
 task_num1 = int(sys.argv[1])
@@ -39,10 +39,10 @@ event_idx, pool_size = event_list[0], pool_size[task_num1%2]
 
 seedbank = []
 np.random.seed(31415926)
-seed_list = np.random.randint(1e5, 1e6, 5)
+seed_list = np.random.randint(1e5, 1e8, 5)
 for seed in seed_list:
     np.random.seed(seed)
-    seedbank.append([np.random.randint(1e5, 1e6, 5), np.random.randint(1e5, 1e6, 5)])
+    seedbank.append([np.random.randint(1e5, 1e8, 5), np.random.randint(1e5, 1e8, 5)])
 seedlist = seedbank[task_num2]
 label = label_list[task_num1]+'_seed'+sys.argv[2]
 label += '_thmeco' if useMECO else '_tmerger'
@@ -170,7 +170,7 @@ if run_code:
                         self.gate_parames = {'t_gate_start':gate_time_start, 't_gate_end': start_time+duration}
                         self.model = GatedGaussianNoise(waveform_params, strain_data, f_lower, psds=psds, static_params=self.static_params)
                         self.model.update(**self.gate_parames)
-                        self.lognl = self.model._lognl()
+                        self.lognl = self.model._lognl() # pad zero in invpsd in gate.py?
                     else:
                         self.model = GaussianNoise(waveform_params, strain_data, f_lower, psds=psds, static_params=self.static_params)
                         self.lognl = self.model.lognl
@@ -311,7 +311,7 @@ if run_code:
                 gate_time_list.append(time_of_event)
             duration = 2**(np.ceil(np.log2(insp_time)))
             duration_list.append(duration)
-            start_time = time_of_event - duration + 0.2
+            start_time = time_of_event - duration + 0.6
             start_time_list.append(start_time)
             static_params.update({'f_lower':f_lower, 'f_final': f_upper})
             InjectModel = InspiralLikelihood(det_names, start_time, duration, None, None, None, **static_params)
@@ -324,9 +324,11 @@ if run_code:
                 else:
                     fpath = '/Users/tangsp/Work/GW/Codes/GW/Frames/PSDs/T2000012-v2/'+fname+'.txt'
                 psd = from_txt(fpath, psd_length, 1./duration, f_lower, is_asd_file=True)
-                noise_fd.update({det: frequency_noise_from_psd(psd, seed=seedlist[seed_idx[i]][j])})
+                # Should I use the psd padded with the value at the lowest frequency to generate the noise?
+                #noise_fd.update({det: frequency_noise_from_psd(psd, seed=seedlist[seed_idx[i]][j])})
                 flow_index = int(f_lower*duration)
                 psd[:flow_index] = psd[flow_index]
+                noise_fd.update({det: frequency_noise_from_psd(psd, seed=seedlist[seed_idx[i]][j])})
                 PSDs.update({det: psd})
             psds_list.append(PSDs)
             strains_fd_dict = {det: signals_fd_dict[det]+noise_fd[det] for det in det_names}
@@ -350,6 +352,7 @@ if run_code:
                 '2g_mass_ratio': injection_parameters['2g_mass_2']/injection_parameters['2g_mass_1']})
             event_tag_list.append('2g_')
 
+        delta_tc = 0.1 #1e-6 if useGatedModel else 0.1
         for gen_num in event_tag_list:
             priors[gen_num+'mass_1'] = Constraint(name='mass_1', minimum=5.0, maximum=100, unit='$M_{\\odot}$')
             priors[gen_num+'mass_2'] = Constraint(name='mass_2', minimum=5.0, maximum=100, unit='$M_{\\odot}$')
@@ -363,8 +366,8 @@ if run_code:
             priors[gen_num+'phi_12'] = Uniform(name='phi_12', minimum=0, maximum=2 * np.pi, boundary='periodic', latex_label='$\\Delta \\phi^{\\rm '+gen_num[:-1]+'}$')
             priors[gen_num+'phi_jl'] = Uniform(name='phi_jl', minimum=0, maximum=2 * np.pi, boundary='periodic', latex_label='$\\phi_{\\rm JL}^{\\rm '+gen_num[:-1]+'}$')
             priors[gen_num+'theta_jn'] = Sine(name='theta_jn', latex_label='$\\theta_{\\rm JN}^{\\rm '+gen_num[:-1]+'}$')
-            priors[gen_num+'geocent_time'] = Uniform(name='geocent_time', minimum=injection_parameters[gen_num+'geocent_time']-0.1, \
-                maximum=injection_parameters[gen_num+'geocent_time']+0.1, latex_label='$t_{c}^{\\rm '+gen_num[:-1]+'}$')
+            priors[gen_num+'geocent_time'] = Uniform(name='geocent_time', minimum=injection_parameters[gen_num+'geocent_time']-delta_tc, \
+                maximum=injection_parameters[gen_num+'geocent_time']+delta_tc, latex_label='$t_{c}^{\\rm '+gen_num[:-1]+'}$')
             priors[gen_num+'phase'] = Uniform(name='phase', minimum=0, maximum=2 * np.pi, boundary='periodic', latex_label='$\\phi^{\\rm '+gen_num[:-1]+'}$')
             priors[gen_num+'psi'] = Uniform(name='psi', minimum=0, maximum=np.pi, latex_label='$\\psi^{\\rm '+gen_num[:-1]+'}$')
         if useGatedModel:
@@ -384,7 +387,7 @@ if run_code:
             share_par_names=share_par_names, priors=priors, f_ref=f_ref, event_tag_list=event_tag_list, pycbc_params=None)
 
         likelihood.parameters.update(injection_parameters)
-        likelihood.log_likelihood()
+        print('maximum likelihood: {}'.format(likelihood.log_likelihood()))
         for llk_model in likelihood.likelihood_list:
             print(llk_model.calculate_optimalSNR())
 
